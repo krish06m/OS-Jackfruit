@@ -15,7 +15,8 @@ The project has two integrated parts:
 
 | Name | SRN |
 |------|-----|
-| Krish Mathur | krish06m |
+| Krish Mathur | PES1UG24AM914 |
+| Vismay HS | PES1UG24AM320 |
 
 ---
 
