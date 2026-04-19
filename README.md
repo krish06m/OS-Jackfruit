@@ -45,14 +45,19 @@ This produces `engine`, `monitor.ko`, `memory_hog`, `cpu_hog`, and `io_pulse`.
 
 ```bash
 cd ~/OS-Jackfruit
-mkdir rootfs
+mkdir rootfs-base
 wget https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz
-tar -xzf alpine-minirootfs-3.20.3-x86_64.tar.gz -C rootfs
+tar -xzf alpine-minirootfs-3.20.3-x86_64.tar.gz -C rootfs-base
 
-# Copy workload binaries into rootfs
-cp boilerplate/memory_hog rootfs/
-cp boilerplate/cpu_hog rootfs/
-cp boilerplate/io_pulse rootfs/
+# Copy workload binaries into the base template first
+cp boilerplate/memory_hog rootfs-base/
+cp boilerplate/cpu_hog rootfs-base/
+cp boilerplate/io_pulse rootfs-base/
+
+# Create one writable rootfs copy per container
+cp -a rootfs-base rootfs-alpha
+cp -a rootfs-base rootfs-beta
+cp -a rootfs-base rootfs-gamma
 ```
 
 ### Step 3: Load the Kernel Module
@@ -67,21 +72,24 @@ sudo dmesg | tail -3            # should show "container_monitor: loaded"
 ### Step 4: Start the Supervisor (Terminal 1)
 
 ```bash
-sudo ~/OS-Jackfruit/boilerplate/engine supervisor ~/OS-Jackfruit/rootfs
+sudo ~/OS-Jackfruit/boilerplate/engine supervisor ~/OS-Jackfruit/rootfs-base
 ```
 
 ### Step 5: Launch and Manage Containers (Terminal 2)
 
 ```bash
 # Start containers in background
-sudo ~/OS-Jackfruit/boilerplate/engine start alpha /memory_hog 64 128
-sudo ~/OS-Jackfruit/boilerplate/engine start beta /cpu_hog 64 128
+sudo ~/OS-Jackfruit/boilerplate/engine start alpha ~/OS-Jackfruit/rootfs-alpha /memory_hog --soft-mib 64 --hard-mib 128
+sudo ~/OS-Jackfruit/boilerplate/engine start beta ~/OS-Jackfruit/rootfs-beta /cpu_hog --soft-mib 64 --hard-mib 128
 
 # List tracked containers
 sudo ~/OS-Jackfruit/boilerplate/engine ps
 
 # View logs
 sudo ~/OS-Jackfruit/boilerplate/engine logs alpha
+
+# Run a container in the foreground and print its exit status
+sudo ~/OS-Jackfruit/boilerplate/engine run gamma ~/OS-Jackfruit/rootfs-gamma /bin/sh --soft-mib 40 --hard-mib 64
 
 # Stop a container
 sudo ~/OS-Jackfruit/boilerplate/engine stop beta
@@ -99,9 +107,9 @@ sudo dmesg | grep container_monitor
 
 ```bash
 # Run two cpu_hog processes with different nice values
-sudo nice -n -10 ~/OS-Jackfruit/rootfs/cpu_hog &
+sudo nice -n -10 ~/OS-Jackfruit/rootfs-beta/cpu_hog &
 HIGH_PID=$!
-sudo nice -n 10  ~/OS-Jackfruit/rootfs/cpu_hog &
+sudo nice -n 10  ~/OS-Jackfruit/rootfs-alpha/cpu_hog &
 LOW_PID=$!
 wait
 ```
@@ -122,10 +130,10 @@ ps aux | grep engine   # should show nothing
 make
 sudo insmod monitor.ko
 ls -l /dev/container_monitor
-sudo ./engine supervisor ./rootfs                          # Terminal 1
+sudo ./engine supervisor ./rootfs-base                     # Terminal 1
 
-sudo ./engine start alpha /memory_hog 64 128              # Terminal 2
-sudo ./engine start beta  /cpu_hog 64 128
+sudo ./engine start alpha ./rootfs-alpha /memory_hog --soft-mib 64 --hard-mib 128
+sudo ./engine start beta  ./rootfs-beta /cpu_hog --soft-mib 64 --hard-mib 128
 sudo ./engine ps
 sudo ./engine logs alpha
 sudo ./engine stop beta
@@ -145,7 +153,7 @@ Ubuntu 24.04 confirmed, `build-essential` and `linux-headers` installed, repo cl
 
 ---
 
-### Screenshot 3 — Binaries Confirmed, Kernel Module Loaded, Supervisor Started
+### Screenshot 2 — Binaries Confirmed, Kernel Module Loaded, Supervisor Started
 
 `engine` (27KB) and `monitor.ko` (393KB) confirmed present. `sudo insmod monitor.ko` created `/dev/container_monitor`. Supervisor started and container `alpha` launched with pid=55074.
 
@@ -153,15 +161,15 @@ Ubuntu 24.04 confirmed, `build-essential` and `linux-headers` installed, repo cl
 
 ---
 
-### Screenshot 4 — CLI Commands Issued and Supervisor Responding (IPC Demo)
+### Screenshot 3 — CLI Commands Issued, Multi-Container Supervision, and Supervisor Responding (IPC Demo)
 
-`start alpha` and `start beta` commands sent from the CLI client over the UNIX domain socket at `/tmp/engine.sock`. The supervisor responded with `"Container started"` for each. The `ps` output shows both containers with name, PID, state, memory limits, and log path.
+`start alpha` and `start beta` commands sent from the CLI client over the UNIX domain socket at `/tmp/engine.sock`. The supervisor responded with `"Container started"` for each. The `ps` output shows both containers running at the same time under one supervisor, with name, PID, state, memory limits, and log path.
 
 ![CLI and IPC](images/s4.png)
 
 ---
 
-### Screenshot 5 — Bounded-Buffer Logging Pipeline
+### Screenshot 4 — Bounded-Buffer Logging Pipeline
 
 `cat /tmp/engine_logs/alpha.log` shows `memory_hog` output captured through the pipe → bounded buffer → consumer thread → log file pipeline. Allocations continue from 8MB up to 144MB, proving all output was captured without data loss right up until the kernel killed the process.
 
@@ -169,7 +177,7 @@ Ubuntu 24.04 confirmed, `build-essential` and `linux-headers` installed, repo cl
 
 ---
 
-### Screenshot 6 — Soft-Limit Warning and Hard-Limit Enforcement (dmesg)
+### Screenshot 5 — Soft-Limit Warning and Hard-Limit Enforcement (dmesg)
 
 `dmesg` output shows:
 - `[SOFT LIMIT]` warning when `alpha` RSS exceeded 64MB (67,280,896 bytes)
@@ -177,21 +185,21 @@ Ubuntu 24.04 confirmed, `build-essential` and `linux-headers` installed, repo cl
 - Subsequent registration and unregistration of `beta`, `high_prio`, `low_prio`
 - `container_monitor: unloaded` confirming clean module removal
 
-The `ps` output shows `alpha` in state `killed`, confirming the supervisor's metadata correctly reflects the kernel-level kill.
+The `ps` output shows `alpha` in state `hard_limit_killed`, confirming the supervisor's metadata correctly reflects the kernel-level kill.
 
 ![dmesg Soft and Hard Limit](images/s6.png)
 
 ---
 
-### Screenshot 7 — Metadata Tracking (`ps` command)
+### Screenshot 6 — Metadata Tracking (`ps` command)
 
-All four containers tracked simultaneously with full metadata: name, host PID, state (`killed`/`stopped`), soft and hard memory limits in MB, and log file path. `alpha` correctly shows state `killed` (hard limit enforced by kernel module).
+All four containers tracked simultaneously with full metadata: name, host PID, state (`hard_limit_killed`/`stopped`), soft and hard memory limits in MB, and log file path. `alpha` correctly shows state `hard_limit_killed` (hard limit enforced by kernel module).
 
 ![Metadata Tracking](images/s7.png)
 
 ---
 
-### Screenshot 8 — Scheduling Experiment
+### Screenshot 7 — Scheduling Experiment
 
 Two `cpu_hog` processes ran concurrently for 5 seconds with different nice values. At `elapsed=5`:
 
@@ -206,7 +214,7 @@ The higher-priority process completed **~55% more work** in the same wall-clock 
 
 ---
 
-### Screenshot 9 — Clean Teardown
+### Screenshot 8 — Clean Teardown
 
 Supervisor printed `[engine] Shutting down...` and `[engine] Clean exit.` on Ctrl+C. All containers terminated, logging threads joined, and file descriptors closed. `sudo rmmod monitor` succeeded and `dmesg` shows `container_monitor: unloaded`. No zombie processes remain.
 
@@ -224,7 +232,7 @@ The runtime achieves isolation using three Linux namespace types passed directly
 
 **`CLONE_NEWUTS`** gives each container its own hostname and domain name. The runtime calls `sethostname("container", 9)` inside the new namespace so the container believes it is on an isolated machine. The host UTS namespace is completely unaffected.
 
-**`CLONE_NEWNS`** creates a new mount namespace. Inside this namespace, the supervisor calls `chroot()` into the Alpine rootfs and mounts `/proc` so process accounting works correctly inside the container. These mount operations are invisible outside the container.
+**`CLONE_NEWNS`** creates a new mount namespace. Inside this namespace, the container child calls `chroot()` into its Alpine rootfs and mounts `/proc` so process accounting works correctly inside the container. These mount operations are invisible outside the container.
 
 What the host kernel still shares with all containers: the same kernel instance, network namespace (we do not use `CLONE_NEWNET`), IPC namespace, and host clock. The kernel enforces namespace boundaries, but all containers share one scheduler, one physical memory pool, and one kernel page cache. This is the fundamental distinction between containers and full VMs — containers share the kernel, VMs do not.
 
@@ -234,11 +242,11 @@ What the host kernel still shares with all containers: the same kernel instance,
 
 A long-running parent supervisor is essential for three reasons:
 
-**Zombie prevention**: When a child exits it becomes a zombie until its parent calls `wait()`. Without a persistent parent, zombies accumulate. The supervisor installs a `SIGCHLD` handler that calls `waitpid(-1, WNOHANG)` in a loop, reaping all exited children immediately.
+**Zombie prevention**: When a child exits it becomes a zombie until its parent calls `wait()`. Without a persistent parent, zombies accumulate. The supervisor blocks `SIGCHLD` in the main threads and uses a dedicated signal-watcher thread that calls `waitpid(-1, WNOHANG)` in a loop, reaping all exited children immediately.
 
 **Metadata persistence**: Container state (PID, start time, memory limits, log path, exit status) must outlive the container process itself. The supervisor's in-memory `containers[]` array holds this data and updates it when `SIGCHLD` fires, distinguishing graceful stop from hard kill.
 
-**Lifecycle coordination**: The supervisor distinguishes graceful stop (SIGTERM → container exits → state = `stopped`) from kernel-forced kill (SIGKILL from kernel module → state = `killed`). This distinction is visible in the `ps` output.
+**Lifecycle coordination**: The supervisor distinguishes graceful stop (SIGTERM → container exits → state = `stopped`) from kernel-forced kill (SIGKILL from kernel module → state = `hard_limit_killed`). This distinction is visible in the `ps` output.
 
 Process creation uses `clone()` rather than `fork()+exec()` because `clone()` accepts namespace flags directly. The child function runs inside the new namespaces, mounts `/proc`, calls `chroot()`, then `execv("/bin/sh")`. The supervisor retains the host PID returned by `clone()` for tracking and signalling.
 
@@ -258,9 +266,9 @@ The project uses two distinct IPC mechanisms:
 |-----------|---------------------------|----------------|
 | `containers[]` array | Two concurrent `start` calls pick the same empty slot | `containers_lock` mutex |
 | Per-container `state` field | `SIGCHLD` handler writes while CLI reads | Per-container `lock` mutex |
-| `LogBuffer` bounded buffer | Producer and consumer corrupt `head`/`tail`/`count` | `logbuf.lock` mutex + `not_empty` + `not_full` condition variables |
+| `LogBuffer` bounded buffer | Producer and consumer corrupt `head`/`tail`/`count` | `empty_slots` / `filled_slots` semaphores + `logbuf.lock` mutex |
 
-Condition variables are used instead of spinlocks because the consumer may block for long periods. `pthread_cond_wait()` atomically releases the mutex and suspends the thread until signalled — the correct pattern for a blocking producer-consumer queue that avoids wasting CPU.
+Semaphores are used for the classic bounded-buffer producer-consumer algorithm: producers wait on `empty_slots`, consumers wait on `filled_slots`, and the mutex protects the shared `head`, `tail`, and `count` updates. This avoids busy-waiting and still prevents buffer corruption or deadlock.
 
 ---
 
@@ -272,7 +280,7 @@ Condition variables are used instead of spinlocks because the consumer may block
 
 **Why soft and hard limits are different policies**: A soft limit is a warning threshold — the process has exceeded a normal operating range but the situation is not yet critical. The kernel module logs a one-time warning and continues monitoring, giving the supervisor an opportunity to take application-level action. A hard limit is an enforcement threshold — the process must be killed to protect the rest of the system.
 
-**Why enforcement belongs in kernel space**: A user-space daemon polling `/proc/<pid>/status` suffers from a TOCTOU race — the process could exhaust memory between polls. The kernel module runs a timer callback at 2-second intervals inside kernel context, reads RSS atomically via `get_task_mm()`, and sends SIGKILL synchronously with no user-space scheduling delay.
+**Why enforcement belongs in kernel space**: A user-space daemon polling `/proc/<pid>/status` suffers from a TOCTOU race — the process could exhaust memory between polls. The kernel module runs deferred work at 2-second intervals inside kernel context, reads RSS via `get_task_mm()`, and sends SIGKILL with no user-space scheduling delay.
 
 ---
 
@@ -307,17 +315,17 @@ The high-priority process completed approximately **55% more work** in the same 
 
 ### Supervisor Architecture
 
-**Choice**: Single-process supervisor with a non-blocking `accept()` loop polling at 50ms. CLI clients handled synchronously one at a time.
+**Choice**: A long-running supervisor with a non-blocking `accept()` loop plus a worker thread per CLI connection, backed by a dedicated signal-watcher thread.
 
-**Tradeoff**: A multi-threaded supervisor could handle simultaneous CLI commands, but single-threaded handling greatly simplifies locking — the handler runs in the main thread and never races with itself.
+**Tradeoff**: Threaded request handling makes the control plane more concurrent, but it requires careful locking around the container table, lifecycle state, and shutdown path.
 
-**Justification**: For a demonstration runtime with at most 16 containers, single-threaded CLI handling is sufficient and the 50ms delay is imperceptible to users.
+**Justification**: The project has to handle `run`, `start`, `ps`, `logs`, and `stop` concurrently while containers are active. A worker-thread model avoids blocking unrelated CLI requests behind a long-running foreground `run`.
 
 ---
 
 ### IPC and Logging
 
-**Choice**: Pipes for log data, UNIX domain socket for CLI control. Bounded buffer with 256 slots × 512 bytes = 128KB total.
+**Choice**: Pipes for log data, UNIX domain socket for CLI control. Semaphore-based bounded buffer with 256 slots × 512 bytes = 128KB total.
 
 **Tradeoff**: If the consumer (disk writes) falls behind producers, the buffer fills and producers block.
 
@@ -327,11 +335,11 @@ The high-priority process completed approximately **55% more work** in the same 
 
 ### Kernel Monitor
 
-**Choice**: `misc_register()` for the character device. `mutex` for list protection. Kernel timer for periodic RSS checks at 2-second intervals.
+**Choice**: `misc_register()` for the character device. `mutex` for list protection. Deferred work (`delayed_work`) for periodic RSS checks at 2-second intervals.
 
 **Tradeoff**: A 2-second check interval means a process could exceed its hard limit by one full `memory_hog` allocation cycle (8MB) before being killed.
 
-**Justification**: `miscdevice` handles minor number allocation automatically. A `mutex` is correct because the timer callback calls `get_task_mm()` which may sleep. 2 seconds is a reasonable tradeoff between enforcement precision and kernel overhead.
+**Justification**: `miscdevice` handles minor number allocation automatically. A `mutex` is correct because the deferred work callback can sleep while reading task state. Two seconds is a reasonable tradeoff between enforcement precision and kernel overhead.
 
 ---
 

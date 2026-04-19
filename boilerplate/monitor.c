@@ -7,7 +7,7 @@
 #include <linux/slab.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
-#include <linux/timer.h>
+#include <linux/workqueue.h>
 #include <linux/jiffies.h>
 #include <linux/sched.h>
 #include <linux/pid.h>
@@ -30,12 +30,13 @@ struct container_entry {
     long   soft_limit_bytes;
     long   hard_limit_bytes;
     int    soft_warned;
+    int    hard_limit_hit;
     struct list_head list;
 };
 
 static LIST_HEAD(container_list);
 static DEFINE_MUTEX(container_mutex);
-static struct timer_list check_timer;
+static struct delayed_work check_work;
 
 /* Read RSS in bytes for a given PID */
 static long get_rss_bytes(pid_t pid)
@@ -77,10 +78,13 @@ static void kill_process(pid_t pid, const char *container_id)
 }
 
 /* Periodic check callback */
-static void check_all_containers(struct timer_list *t)
+static void check_all_containers_work(struct work_struct *work)
 {
     struct container_entry *entry, *tmp;
     long rss;
+    bool reschedule = true;
+
+    (void)work;
 
     mutex_lock(&container_mutex);
     list_for_each_entry_safe(entry, tmp, &container_list, list) {
@@ -96,11 +100,12 @@ static void check_all_containers(struct timer_list *t)
         }
 
         if (entry->hard_limit_bytes > 0 && rss > entry->hard_limit_bytes) {
-            pr_warn("container_monitor: [HARD LIMIT] container '%s' pid=%d rss=%ld > hard=%ld\n",
-                    entry->container_id, entry->pid, rss, entry->hard_limit_bytes);
-            kill_process(entry->pid, entry->container_id);
-            list_del(&entry->list);
-            kfree(entry);
+            if (!entry->hard_limit_hit) {
+                pr_warn("container_monitor: [HARD LIMIT] container '%s' pid=%d rss=%ld > hard=%ld\n",
+                        entry->container_id, entry->pid, rss, entry->hard_limit_bytes);
+                kill_process(entry->pid, entry->container_id);
+                entry->hard_limit_hit = 1;
+            }
             continue;
         }
 
@@ -113,7 +118,8 @@ static void check_all_containers(struct timer_list *t)
     }
     mutex_unlock(&container_mutex);
 
-    mod_timer(&check_timer, jiffies + msecs_to_jiffies(CHECK_INTERVAL_MS));
+    if (reschedule)
+        schedule_delayed_work(&check_work, msecs_to_jiffies(CHECK_INTERVAL_MS));
 }
 
 /* ioctl handler */
@@ -136,8 +142,8 @@ static long monitor_ioctl(struct file *file, unsigned int cmd, unsigned long arg
         entry->soft_limit_bytes = reg.soft_limit_bytes;
         entry->hard_limit_bytes = reg.hard_limit_bytes;
         entry->soft_warned      = 0;
-        strncpy(entry->container_id, reg.container_id, CONTAINER_ID_MAX - 1);
-        entry->container_id[CONTAINER_ID_MAX - 1] = '\0';
+        entry->hard_limit_hit   = 0;
+        snprintf(entry->container_id, sizeof(entry->container_id), "%s", reg.container_id);
         INIT_LIST_HEAD(&entry->list);
 
         mutex_lock(&container_mutex);
@@ -186,7 +192,7 @@ static long monitor_ioctl(struct file *file, unsigned int cmd, unsigned long arg
                 rss = get_rss_bytes(entry->pid);
                 qry.current_rss_bytes   = (rss >= 0) ? rss : 0;
                 qry.soft_limit_exceeded = entry->soft_warned;
-                qry.hard_limit_exceeded = 0;
+                qry.hard_limit_exceeded = entry->hard_limit_hit;
                 qry.alive               = (rss >= 0) ? 1 : 0;
                 break;
             }
@@ -227,8 +233,8 @@ static int __init monitor_init(void)
         return ret;
     }
 
-    timer_setup(&check_timer, check_all_containers, 0);
-    mod_timer(&check_timer, jiffies + msecs_to_jiffies(CHECK_INTERVAL_MS));
+    INIT_DELAYED_WORK(&check_work, check_all_containers_work);
+    schedule_delayed_work(&check_work, msecs_to_jiffies(CHECK_INTERVAL_MS));
 
     pr_info("container_monitor: loaded, /dev/%s ready\n", DEVICE_NAME);
     return 0;
@@ -238,7 +244,7 @@ static void __exit monitor_exit(void)
 {
     struct container_entry *entry, *tmp;
 
-    del_timer_sync(&check_timer);
+    cancel_delayed_work_sync(&check_work);
 
     mutex_lock(&container_mutex);
     list_for_each_entry_safe(entry, tmp, &container_list, list) {
